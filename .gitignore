@@ -1,0 +1,4 @@
+nsynth-test.jsonwav/
+nsynth-train.jsonwav/
+nsynth-valid.jsonwav/
+_pycache_/
