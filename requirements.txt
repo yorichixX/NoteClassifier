@@ -1,0 +1,31 @@
+# Audio Note Classifier — dependencies
+# Install with:
+#   pip install -r requirements.txt
+#
+# For PyTorch with CUDA (GPU support), install separately first:
+#   CUDA 12.1 (most common for recent drivers):
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   CUDA 11.8:
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#   CPU only:
+#     pip install torch torchvision torchaudio
+#
+# Check your CUDA version with:  nvidia-smi  (top right corner of output)
+
+# Deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Audio processing
+librosa>=0.10.0
+soundfile>=0.12.1
+
+# Numerical computing
+numpy>=1.24.0
+
+# Plotting
+matplotlib>=3.7.0
+
+# Built-in (no install needed, listed for clarity)
+# os, json, time, pathlib, sys  — all part of Python standard library
