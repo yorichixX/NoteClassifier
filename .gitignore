@@ -6,3 +6,4 @@ best_weights.pt
 note_classifier_weights.pt
 module_05_activations.png
 module_05_saliency.png
+training_curves.png
