@@ -2,3 +2,7 @@ nsynth-test.jsonwav/
 nsynth-train.jsonwav/
 nsynth-valid.jsonwav/
 _pycache_/
+best_weights.pt
+note_classifier_weights.pt
+module_05_activations.png
+module_05_saliency.png
