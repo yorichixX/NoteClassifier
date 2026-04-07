@@ -188,8 +188,7 @@ def visualize_saliency(S_db, saliency, predicted_note,
 if __name__ == "__main__":
 
     # Point this at any NSynth .wav file you want to demo
-    WAV_PATH = r"Give_path"
-
+    WAV_PATH = r"E:\programming\machine learning\projects\DL_project\nsynth-test.jsonwav\nsynth-test\audio\vocal_synthetic_003-096-100.wav"
     # These must match exactly what was used in Module 4 training
     N_MELS    = 64
     N_FRAMES  = 345

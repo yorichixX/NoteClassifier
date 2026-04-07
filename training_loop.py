@@ -32,94 +32,109 @@ from model import NoteClassifierCNN
 # ================================================================
 class NSynthDataset(Dataset):
     """
-    Loads pre-computed .npy mel spectrograms from cache_dir.
-    Falls back to on-the-fly librosa if cache_dir is None,
-    but cached mode is strongly preferred for GPU utilisation.
+    Two modes, chosen automatically:
 
-    Label: pitch % 12  →  0=C, 1=C#, 2=D, 3=D#, 4=E, 5=F,
-                           6=F#, 7=G, 8=G#, 9=A, 10=A#, 11=B
+    FAST  (memmap) — if *cache_dir* contains specs.npy + labels.npy
+        np.memmap lets the OS map the file into virtual memory and serve
+        slices with zero per-file open() overhead.  Eliminates the
+        100↔0→100 GPU starvation pattern caused by individual file I/O.
+        Build the merged files once with build_cache.py.
 
-    augment=True: apply random time shift, freq shift, and noise.
-    Use augment=True for training only, never for validation.
+    SLOW  (individual .npy) — fallback when merged files don't exist yet
+        Falls back to loading one .npy per sample (requires examples.json
+        via nsynth_root).  Still faster than raw WAV loading.
     """
 
     def __init__(self, nsynth_root, cache_dir,
                  n_mels=64, n_frames=345,
                  max_samples=None, augment=False):
 
-        self.cache_dir  = cache_dir
-        self.n_mels     = n_mels
-        self.n_frames   = n_frames
-        self.augment    = augment
+        self.n_mels   = n_mels
+        self.n_frames = n_frames
+        self.augment  = augment
 
-        # Read examples.json for labels
-        json_path = os.path.join(nsynth_root, 'examples.json')
-        with open(json_path, 'r') as f:
-            metadata = json.load(f)
+        specs_path  = os.path.join(cache_dir, 'specs.npy')
+        labels_path = os.path.join(cache_dir, 'labels.npy')
 
-        audio_dir    = os.path.join(nsynth_root, 'audio')
-        self.samples = []
-        for name, info in metadata.items():
-            pitch_class = info['pitch'] % 12
-            wav_path    = os.path.join(audio_dir, name + '.wav')
-            npy_path    = os.path.join(cache_dir, name + '.npy')
+        if os.path.exists(specs_path) and os.path.exists(labels_path):
+            labels_arr = np.load(labels_path)   # (N,) int64 — small, safe to pickle
+            N          = len(labels_arr)
 
-            # Only include samples that are both in the JSON
-            # AND have a cached .npy file on disk
-            if os.path.exists(npy_path):
-                self.samples.append((npy_path, pitch_class))
-            elif os.path.exists(wav_path):
-                # npy not cached yet — skip and warn once
-                pass
+            if max_samples is not None:
+                labels_arr = labels_arr[:max_samples]
+                N          = len(labels_arr)
 
-        if max_samples is not None:
-            self.samples = self.samples[:max_samples]
+            self.labels       = labels_arr
+            self._specs_path  = specs_path          # stored for lazy open
+            self._specs       = None                # opened lazily per worker
+            self.mode         = 'memmap'
+            self.samples      = None
+            print(f"NSynthDataset [memmap ⚡]: {N:,} samples  "
+                  f"| augment={augment}  | {cache_dir}")
 
-        print(f"NSynthDataset: {len(self.samples)} samples  "
-              f"| augment={augment}  | cache={cache_dir}")
+        else:
+            # ── SLOW PATH: individual .npy per sample ───────────────────
+            json_path = os.path.join(nsynth_root, 'examples.json')
+            with open(json_path, 'r') as f:
+                metadata = json.load(f)
 
-        if len(self.samples) == 0:
-            raise RuntimeError(
-                f"No cached .npy files found in {cache_dir}.\n"
-                "Run precompute_spectrograms() first.")
+            audio_dir = os.path.join(nsynth_root, 'audio')
+            pairs: list[tuple[str, int]] = []
+            for name, info in metadata.items():
+                npy_path = os.path.join(cache_dir, name + '.npy')
+                if os.path.exists(npy_path):
+                    pairs.append((npy_path, info['pitch'] % 12))
+
+            if max_samples is not None:
+                pairs = pairs[:max_samples]
+
+            self.samples = pairs
+            self.mode    = 'files'
+            self.labels  = None
+            self.specs   = None
+            print(f"NSynthDataset [files]: {len(pairs):,} samples  "
+                  f"| augment={augment}  | {cache_dir}")
+
+            if len(pairs) == 0:
+                raise RuntimeError(
+                    f"No cached .npy files found in {cache_dir}.\n"
+                    f"Run precompute_cache.py first, or run build_cache.py "
+                    f"to generate the fast merged cache.")
 
     def __len__(self):
+        if self.mode == 'memmap':
+            return len(self.labels)
         return len(self.samples)
 
     def _augment(self, S):
-        """
-        Three cheap augmentations, each applied randomly every access.
-
-        Time shift  — np.roll along axis=1 (time axis)
-          Shifts the spectrogram left or right by up to 10 frames.
-          Simulates the note starting slightly earlier or later in the clip.
-          np.roll wraps content: stuff shifted off the right appears on
-          the left. Fine here because NSynth notes are sustained for 4s —
-          the wrap-around region is silence or tail, not a different note.
-
-        Frequency shift — np.roll along axis=0 (mel bin axis)
-          Shifts up or down by up to 2 mel bins (~3% of the 64-bin range).
-          Simulates the same note played very slightly sharp or flat.
-          2 bins is small enough that the pitch class is unambiguous.
-
-        Gaussian noise — std = 0.01 (1% of the [0,1] normalised range)
-          Prevents the model from memorising exact spectrogram pixel values.
-          Forces it to rely on overall spectral shape instead.
-        """
-        S = np.roll(S, np.random.randint(-10, 10),  axis=1)  # time shift
-        S = np.roll(S, np.random.randint(-2,  3),   axis=0)  # freq shift
+        """Random time shift, freq shift, and Gaussian noise — all in-place on a copy."""
+        S = np.roll(S, np.random.randint(-10, 10), axis=1)   # time shift
+        S = np.roll(S, np.random.randint(-2,  3),  axis=0)   # freq shift
         S = S + np.random.randn(*S.shape).astype(np.float32) * 0.01
         return np.clip(S, 0.0, 1.0)
 
     def __getitem__(self, idx):
-        npy_path, label = self.samples[idx]
-        S = np.load(npy_path)           # float32, shape (n_mels, n_frames)
+        if self.mode == 'memmap':
+            # Lazy open: the memmap is created once per worker process on the
+            # first __getitem__ call, then reused for all subsequent calls in
+            # that worker.  This avoids pickling the file handle across spawn.
+            if self._specs is None:
+                # np.load with mmap_mode='r' returns a memmap that correctly
+                # skips the .npy header.  Raw np.memmap() starts at byte 0
+                # and reads header bytes as data → garbage values → 1e26 loss.
+                self._specs = np.load(self._specs_path, mmap_mode='r')
+            # np.array() copies the slice into a plain contiguous array so
+            # each sample returned to the DataLoader is independent.
+            S     = np.array(self._specs[idx], dtype=np.float32)
+            label = int(self.labels[idx])
+        else:
+            npy_path, label = self.samples[idx]
+            S = np.load(npy_path)
 
         if self.augment:
             S = self._augment(S)
 
-        # unsqueeze(0): (n_mels, n_frames) -> (1, n_mels, n_frames)
-        # The 1 is the channel dimension Conv2d expects (like grayscale).
+        # (n_mels, n_frames) → (1, n_mels, n_frames)  — channel dim for Conv2d
         return torch.FloatTensor(S).unsqueeze(0), torch.tensor(label, dtype=torch.long)
 
 
@@ -147,10 +162,10 @@ def setup_loss_and_optimizer(model, learning_rate=3e-4):
 def train_one_batch(model, batch_x, batch_y, criterion, optimizer, device):
     model.train()
 
-    batch_x = batch_x.to(device)   # move input to GPU
-    batch_y = batch_y.to(device)   # move labels to GPU
-    # Model weights are already on GPU (model.to(device) in main).
-    # Both operands of every matrix multiply must be on the same device.
+    batch_x = batch_x.to(device, non_blocking=True)   # async CPU→GPU (works with pin_memory)
+    batch_y = batch_y.to(device, non_blocking=True)
+    # non_blocking=True lets the CPU return immediately and overlap
+    # the DMA transfer with other CPU work (next batch prefetch).
 
     optimizer.zero_grad()           # clear gradients from previous batch
     logits = model(batch_x)         # forward pass — builds computation graph
@@ -176,8 +191,8 @@ def evaluate(model, dataloader, criterion, device):
 
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
-            batch_x   = batch_x.to(device)
-            batch_y   = batch_y.to(device)
+            batch_x   = batch_x.to(device, non_blocking=True)
+            batch_y   = batch_y.to(device, non_blocking=True)
             logits    = model(batch_x)
             loss      = criterion(logits, batch_y)
             total_loss += loss.item()
@@ -302,10 +317,26 @@ if __name__ == "__main__":
         print(f"  GPU : {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 
-    # Paths — update if your folder layout differs
-    TRAIN_ROOT  = r"" #give a valid path
-    TRAIN_CACHE = r"" #give a valid path
-    VALID_CACHE = r"" #give a valid path
+    BASE = r"E:\programming\machine learning\projects\DL_project"
+
+    # NSynthDataset auto-detects which mode to use:
+    #   ⚡ memmap (fast)  — if specs.npy + labels.npy exist in the cache dir
+    #                        run build_cache.py once to generate these
+    #   📄 files (slower) — fallback to individual .npy files
+    TRAIN_ROOT  = rf"{BASE}\nsynth-train.jsonwav\nsynth-train"   # for examples.json (files mode only)
+    TRAIN_CACHE = rf"{BASE}\nsynth-train.jsonwav\outputs"        # merged cache (preferred)
+
+    VALID_ROOT  = rf"{BASE}\nsynth-valid.jsonwav\nsynth-valid"
+    VALID_CACHE = rf"{BASE}\nsynth-valid.jsonwav\outputs"        # merged cache (preferred)
+
+    # Fallback: if outputs/ doesn't have specs.npy yet, point to individual .npy files:
+    import os as _os
+    if not _os.path.exists(rf"{TRAIN_CACHE}\specs.npy"):
+        TRAIN_CACHE = rf"{BASE}\nsynth-train.jsonwav\cache"
+        print("[WARN] Merged cache not found — using individual .npy files (slower).")
+        print("       Run build_cache.py to generate the fast merged cache.")
+    if not _os.path.exists(rf"{VALID_CACHE}\specs.npy"):
+        VALID_CACHE = rf"{BASE}\nsynth-valid.jsonwav\cache"
 
     N_MELS    = 64
     N_FRAMES  = 345
@@ -313,8 +344,7 @@ if __name__ == "__main__":
 
     # Datasets
     # max_samples=None uses the full split.
-    # Set max_samples=5000 / 1000 first to do a quick sanity-check run
-    # before committing to the full dataset.
+    # Set max_samples=5000 / 1000 for a quick sanity-check before the full run.
     train_dataset = NSynthDataset(
         TRAIN_ROOT, cache_dir=TRAIN_CACHE,
         n_mels=N_MELS, n_frames=N_FRAMES,
@@ -325,17 +355,19 @@ if __name__ == "__main__":
         n_mels=N_MELS, n_frames=N_FRAMES,
         max_samples=None, augment=False)
 
-    # DataLoaders
-    # num_workers=0 required on Windows (no fork-based multiprocessing).
-    # Increase batch_size if VRAM allows — larger batches mean fewer
-    # steps per epoch and more stable gradient estimates.
-    train_loader = DataLoader(train_dataset, batch_size=64,
-                            shuffle=True,  num_workers=0)
-    val_loader   = DataLoader(val_dataset,   batch_size=64,
-                            shuffle=False, num_workers=0)
-    # pin_memory=True speeds up CPU->GPU transfers by keeping batch tensors
-    # in page-locked (pinned) memory, which the GPU DMA engine can read
-    # directly without an extra copy. Only worth enabling when using GPU.
+    # DataLoaders — GPU-optimised settings
+    pin = (device.type == "cuda")   # pin_memory only useful on GPU
+    train_loader = DataLoader(
+        train_dataset, batch_size=256,
+        shuffle=True,  num_workers=4,
+        pin_memory=pin, persistent_workers=True)
+    val_loader = DataLoader(
+        val_dataset, batch_size=256,
+        shuffle=False, num_workers=4,
+        pin_memory=pin, persistent_workers=True)
+    # pin_memory=True keeps tensors in page-locked RAM so the GPU DMA can
+    # read them directly — avoids an extra CPU copy on every .to(device).
+    # persistent_workers=True keeps worker processes alive between epochs.
 
     # Model
     model = NoteClassifierCNN(
@@ -358,3 +390,4 @@ if __name__ == "__main__":
 
     torch.save(model.state_dict(), 'note_classifier_weights.pt')
     print("\nWeights saved: note_classifier_weights.pt")
+
