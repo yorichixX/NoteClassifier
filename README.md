@@ -390,4 +390,4 @@ After training on the full NSynth training set (~289K samples), with early stopp
 
 ## License
 
-This project uses the [NSynth dataset](https://magenta.tensorflow.org/datasets/nsynth) by Google Magenta, released under a Creative Commons Attribution 4.0 International License (CC BY 4.0).
+
